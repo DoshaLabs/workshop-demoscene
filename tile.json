@@ -1,7 +1,7 @@
 {
   "id": "demoscene",
   "name": "Demoscene",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "workshop": "^1.1",
   "author": "DoshaLabs",
   "repo": "https://github.com/DoshaLabs/workshop-demoscene",

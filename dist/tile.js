@@ -18,7 +18,7 @@ let scene = null // the one running: an entry plus { meta, bytes }
 let previous = null // the id to fall back to if the GPU drops this one
 let loadedAt = performance.now()
 let error = ''
-const cam = { x: 0, y: 2, z: 0, yaw: 0, pitch: 0, yawVel: 0, pitchVel: 0 }
+const cam = { x: 0, y: 2, z: 0, yaw: 0, pitch: 0, yawVel: 0, pitchVel: 0, vel: [0, 0, 0] }
 let autopilot = true
 let speedMul = 1
 const keys = new Set()
@@ -57,7 +57,7 @@ const lookahead = () => clamp(speed() * 1.2, 1.5, 10)
 
 function respawn() {
   const s = scene.meta.spawn
-  Object.assign(cam, { x: s.x, y: s.y, z: s.z, yaw: s.yaw, pitch: 0, yawVel: 0, pitchVel: 0 })
+  Object.assign(cam, { x: s.x, y: s.y, z: s.z, yaw: s.yaw, pitch: 0, yawVel: 0, pitchVel: 0, vel: [0, 0, 0] })
   reading = null
   unstick = 60
 }
@@ -142,12 +142,21 @@ function update(dt, t) {
     steer(dt, t)
     const room = reading ? clamp(Math.min(reading.ahead, reading.near * 2.5) / lookahead(), 0.25, 1) : 0.5
     v = basis().f.map((c) => c * speed() * room)
+    cam.vel = v
   } else {
     const on = (...codes) => codes.some((c) => keys.has(c))
-    if (on('ArrowLeft')) cam.yaw -= 1.6 * dt
-    if (on('ArrowRight')) cam.yaw += 1.6 * dt
-    if (on('ArrowUp')) cam.pitch = clamp(cam.pitch + 1.2 * dt, -1.5, 1.5)
-    if (on('ArrowDown')) cam.pitch = clamp(cam.pitch - 1.2 * dt, -1.5, 1.5)
+    // Turning: keys and the right stick set a target rate; the camera eases toward it, so a look
+    // starts and stops softly instead of snapping.
+    let yawT = pad.look[0] * 2.2, pitchT = pad.look[1] * 1.6
+    if (on('ArrowLeft')) yawT -= 1.6
+    if (on('ArrowRight')) yawT += 1.6
+    if (on('ArrowUp')) pitchT += 1.2
+    if (on('ArrowDown')) pitchT -= 1.2
+    const ease = (k) => 1 - Math.exp(-dt * k)
+    cam.yawVel += (yawT - cam.yawVel) * ease(10)
+    cam.pitchVel += (pitchT - cam.pitchVel) * ease(10)
+    cam.yaw += cam.yawVel * dt
+    cam.pitch = clamp(cam.pitch + cam.pitchVel * dt, -1.5, 1.5)
     let m = [0, 0, 0]
     if (on('KeyW')) m = add(m, f)
     if (on('KeyS')) m = add(m, f, -1)
@@ -155,7 +164,16 @@ function update(dt, t) {
     if (on('KeyA')) m = add(m, r, -1)
     if (on('Space', 'KeyE')) m = add(m, [0, 1, 0])
     if (on('ShiftLeft', 'ShiftRight', 'KeyQ')) m = add(m, [0, -1, 0])
-    if (Math.hypot(...m) > 0) v = norm(m).map((c) => c * speed() * 2)
+    if (Math.hypot(...m) > 0) m = norm(m)
+    // The left stick is analog: half a push is half the speed. Triggers lift and sink.
+    m = add(add(add(m, f, pad.move[1]), r, pad.move[0]), [0, 1, 0], pad.lift)
+    const l = Math.hypot(...m)
+    if (l > 1) m = m.map((c) => c / l)
+    const target = m.map((c) => c * speed() * 2 * (pad.boost ? 3 : 1))
+    // Velocity eases toward the target: a glide in, a glide out.
+    const k = ease(l > 0.01 ? 3.5 : 2.5)
+    cam.vel = cam.vel.map((c, i) => c + (target[i] - c) * k)
+    v = cam.vel
   }
   let step = dt
   const move = Math.hypot(...v) * dt
@@ -259,12 +277,57 @@ function tick(now) {
   const res = renderer.poll()
   if (res) applyReading(res)
   const t = (now - loadedAt) / 1000
+  readPad(dt)
   update(dt, t)
   renderer.probe(probePoints(), camUniform(), t)
   resize()
   renderer.draw(canvas.width, canvas.height, camUniform(), t, STEPS[view] ?? 120)
   adapt(dt)
 }
+
+// ---- a game controller (standard mapping: Xbox, PlayStation, Switch Pro) ------------------------
+// Left stick flies, right stick looks, the triggers rise and sink, bumpers change speed, a stick
+// click boosts, A respawns, Y toggles the autopilot, the d-pad's left and right change worlds.
+const pad = { move: [0, 0], look: [0, 0], lift: 0, boost: false, held: [], name: null }
+const curve = (x, dz = 0.14) => {
+  const a = Math.abs(x)
+  return a < dz ? 0 : Math.sign(x) * ((a - dz) / (1 - dz)) ** 1.8
+}
+function readPad(dt) {
+  let gp = null
+  try {
+    for (const g of navigator.getGamepads?.() ?? []) if (g?.connected) { gp = g; break }
+  } catch { gp = null }
+  pad.name = gp?.id ?? null
+  if (!gp) {
+    pad.move = [0, 0]; pad.look = [0, 0]; pad.lift = 0; pad.boost = false
+    return
+  }
+  const val = (i) => gp.buttons[i]?.value ?? 0
+  const down = (i) => !!gp.buttons[i]?.pressed
+  const ax = (i) => curve(gp.axes[i] ?? 0)
+  pad.move = [ax(0), -ax(1)]
+  pad.look = [ax(2), -ax(3)]
+  pad.lift = val(7) - val(6)
+  pad.boost = down(10) || down(11)
+  if (down(4)) speedMul = clamp(speedMul * Math.exp(-dt * 1.2), 0.2, 8)
+  if (down(5)) speedMul = clamp(speedMul * Math.exp(dt * 1.2), 0.2, 8)
+  const pressed = (i) => down(i) && !pad.held[i]
+  const active = Math.hypot(...pad.move, ...pad.look, pad.lift) > 0 || gp.buttons.some((b) => b.pressed)
+  if (pressed(3)) {
+    autopilot = !autopilot
+    drawHud()
+  } else if (active && autopilot) {
+    autopilot = false
+    drawHud()
+  }
+  if (pressed(0)) respawn()
+  if (pressed(14)) step(-1)
+  if (pressed(15)) step(1)
+  if (active) wake()
+  pad.held = gp.buttons.map((b) => b.pressed)
+}
+addEventListener('gamepadconnected', (e) => flash(`Controller: ${e.gamepad.id.replace(/\s*\(.*$/, '')}`))
 
 // ---- the HUD -----------------------------------------------------------------------------------
 
@@ -332,7 +395,7 @@ function drawHud() {
   hud.append(bar)
   if (error) hud.append(el('div', 'error', error))
   if (asked) hud.append(asked)
-  help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · R respawn · , . worlds'
+  help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · R respawn · , . worlds · controller: sticks fly and look, triggers up and down, bumpers speed, Y autopilot'
   wake()
 }
 
@@ -556,6 +619,7 @@ W.door.handle('status', async () => ({
   resolution: [canvas.width, canvas.height],
   camera: { x: +cam.x.toFixed(2), y: +cam.y.toFixed(2), z: +cam.z.toFixed(2), yaw: Math.round((cam.yaw * 180) / Math.PI), pitch: Math.round((cam.pitch * 180) / Math.PI) },
   clearance: reading ? +reading.d0.toFixed(2) : null,
+  gamepad: pad.name,
   error: error || null
 }))
 
