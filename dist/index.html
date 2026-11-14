@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <!-- No network at all: every world is computed in the page from a scene's source. -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; font-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'" />
     <title>Demoscene</title>
     <link rel="stylesheet" href="tile.css" />
   </head>
@@ -11,6 +11,11 @@
     <canvas id="screen" tabindex="0"></canvas>
     <div id="hud"></div>
     <div id="help"></div>
+    <form id="ask" autocomplete="off">
+      <select aria-label="The session that makes the world" title="The session that makes the world"></select>
+      <input type="text" maxlength="1000" placeholder="Describe a world…" aria-label="Describe a world" />
+      <button type="submit" title="Ask the session (Enter)">Make</button>
+    </form>
     <script type="module" src="tile.js"></script>
   </body>
 </html>

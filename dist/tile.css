@@ -97,7 +97,7 @@ button.danger {
 #help {
   position: fixed;
   left: 10px;
-  bottom: 10px;
+  bottom: 52px;
   padding: 3px 8px;
   border-radius: 6px;
   color: var(--ws-muted);
@@ -113,4 +113,74 @@ body.quiet .bar {
 }
 body.quiet .bar:hover {
   opacity: 1;
+}
+
+/* The prompt box: along the foot in every view. */
+#ask {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--ws-panel) 85%, transparent);
+  border: 1px solid var(--ws-line);
+}
+#ask select,
+#ask input {
+  font: inherit;
+  color: var(--ws-ink);
+  background: color-mix(in srgb, var(--ws-bg) 60%, transparent);
+  border: 1px solid var(--ws-line);
+  border-radius: 6px;
+  padding: 3px 6px;
+  min-width: 0;
+}
+#ask select {
+  flex: 0 1 34%;
+  color: var(--ws-muted);
+}
+#ask input {
+  flex: 1 1 auto;
+}
+#ask input:focus,
+#ask select:focus {
+  outline: none;
+  border-color: var(--ws-accent);
+}
+#ask button {
+  flex: none;
+  background: var(--ws-accent);
+  border-color: var(--ws-accent);
+  color: var(--ws-panel);
+  font-weight: 700;
+}
+#ask button:disabled,
+#ask input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+body[data-view='tile'] #ask {
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  padding: 3px;
+}
+body.quiet #ask:not(:focus-within) {
+  opacity: 0.55;
+}
+.pending {
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--ws-accent-ink, var(--ws-accent));
+  background: color-mix(in srgb, var(--ws-panel) 85%, transparent);
+  border: 1px solid var(--ws-accent);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+@keyframes breathe {
+  50% {
+    opacity: 0.55;
+  }
 }

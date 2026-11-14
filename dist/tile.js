@@ -180,6 +180,7 @@ function activate(entry, compiled) {
   respawn()
   loadedAt = performance.now()
   error = ''
+  pending = null
   W.head.set({ title: scene.meta.title, badge: formatSize(scene.bytes) }).catch(() => {})
   W.storage.set('current', entry.id).catch(() => {})
   drawHud()
@@ -291,8 +292,10 @@ function drawHud() {
   hud.replaceChildren()
   document.body.dataset.view = view
   if (!scene) return
+  const asked = pending && el('div', 'pending', `${pending.name} is making it…`)
   if (view === 'tile' || view === 'float') {
     if (error) hud.append(el('div', 'error', error))
+    if (asked) hud.append(asked)
     return
   }
   const bar = el('div', 'bar')
@@ -328,6 +331,7 @@ function drawHud() {
   }
   hud.append(bar)
   if (error) hud.append(el('div', 'error', error))
+  if (asked) hud.append(asked)
   help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · R respawn · , . worlds'
   wake()
 }
@@ -378,6 +382,7 @@ canvas.addEventListener('pointercancel', endDrag)
 const MOVE = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE', 'KeyQ', 'ShiftLeft', 'ShiftRight', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'])
 addEventListener('keydown', (e) => {
   if (view === 'tile' || view === 'float' || e.metaKey || e.ctrlKey || e.altKey) return
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return // typing a prompt
   wake()
   if (MOVE.has(e.code)) {
     keys.add(e.code)
@@ -417,7 +422,79 @@ W.onViewChange((v) => {
   drawHud()
 })
 
+// ---- the prompt box: the user asks a session for a world ---------------------------------------
+// The tile has no model of its own. What the user types goes to one of their sessions as a line
+// it reads as the user asking; the session writes the world and loads it here through the door.
+
+const ask = document.getElementById('ask')
+const askInput = ask.querySelector('input')
+const picker = ask.querySelector('select')
+let open = [] // the sessions a request can go to
+let pick = null // the one chosen
+let pending = null // { name } while a session is making a world
+let pendingTimer
+
+function drawPicker() {
+  picker.replaceChildren(
+    ...open.map((s) => {
+      const o = el('option', null, s.name || 'session')
+      o.value = s.id
+      o.selected = s.id === pick
+      return o
+    })
+  )
+  const none = open.length === 0
+  picker.hidden = none
+  askInput.disabled = none
+  ask.querySelector('button').disabled = none
+  askInput.placeholder = none ? 'Open a session to make worlds' : 'Describe a world…'
+}
+
+function setSessions(list) {
+  open = list.filter((s) => s.open !== false && s.status !== 'dead')
+  if (!open.some((s) => s.id === pick)) pick = (open.find((s) => s.focused) ?? open[0])?.id ?? null
+  drawPicker()
+}
+
+/** One line, as if the user had typed it to the session. Their words are quoted and kept to one line. */
+function request(text) {
+  const showing = scene ? ` The tile is showing "${scene.meta.title}": if they want that one changed, start from \`node "$WORKSHOP_TILE" demoscene get\`; otherwise make a new world with its own @title.` : ''
+  return `[Demoscene] The user asked the Demoscene tile for a world: "${text}".${showing} If you have not read it in this conversation, run \`node "$WORKSHOP_TILE" demoscene guide\` first and follow it: load the world, look at a snap, fix what you see, then answer in a line.`
+}
+
+picker.addEventListener('change', () => {
+  pick = picker.value
+  W.storage.set('pick', pick).catch(() => {})
+})
+ask.addEventListener('pointerdown', (e) => e.stopPropagation())
+ask.addEventListener('submit', async (e) => {
+  e.preventDefault()
+  const text = askInput.value.replace(/\s+/g, ' ').replace(/"/g, "'").trim().slice(0, 1000)
+  if (!text) return
+  const who = open.find((s) => s.id === pick)
+  if (!who) return flash('Open a session first: it is what makes the world.')
+  if (who.status === 'blocked') return flash(`${who.name} is waiting for you. Answer it first, or pick another session.`)
+  try {
+    await W.sessions.paste(who.id, request(text))
+  } catch (err) {
+    return flash(err.message)
+  }
+  askInput.value = ''
+  askInput.blur()
+  error = ''
+  pending = { name: who.name }
+  clearTimeout(pendingTimer)
+  pendingTimer = setTimeout(() => {
+    pending = null
+    drawHud()
+  }, 10 * 60_000)
+  W.head.set({ title: scene?.meta.title ?? 'Demoscene', badge: 'making…' }).catch(() => {})
+  drawHud()
+})
+
 // ---- the door: how a Claude session makes and shows worlds -------------------------------------
+
+W.door.handle('guide', async () => (await fetch('guide.md')).text())
 
 W.door.handle('load', async (args) => {
   const src = (args.length === 1 ? args[0] : args.join(' ')).trim()
@@ -519,7 +596,10 @@ try {
   throw e
 }
 
-const [stored, current] = await Promise.all([W.storage.get('scenes').catch(() => null), W.storage.get('current').catch(() => null)])
+const [stored, current, picked] = await Promise.all(['scenes', 'current', 'pick'].map((k) => W.storage.get(k).catch(() => null)))
+pick = typeof picked === 'string' ? picked : null
+W.sessions.list().then(setSessions, () => {})
+W.sessions.watch(setSessions)
 saved = Array.isArray(stored) ? stored.filter((s) => s && typeof s.id === 'string' && typeof s.src === 'string') : []
 const first = all().find((s) => s.id === current) ?? all()[0]
 if (!activate(first).ok) activate(all()[0])

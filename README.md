@@ -4,8 +4,9 @@ Tiny procedural worlds for [workshop](https://github.com/DoshaLabs/workshop)'s t
 spirit of the demoscene's 4K intros: a whole landscape from a few hundred bytes of maths, drawn
 live, that you fly around.
 
-Ask any Claude session for one ("make me an alien ocean with glowing jellyfish") and it writes the
-scene, loads it into the tile, looks at a snapshot and fixes what it sees. The tile shows the
+Type what you want in the box at the foot of the tile ("an alien ocean with glowing jellyfish"),
+pick which of your sessions should make it, and press Enter. The session writes the scene, loads
+it into the tile, looks at a snapshot and fixes what it sees. You can also just ask any session. The tile shows the
 size of each world, minified, against the classic 4 KB budget.
 
 ## How a world works
@@ -24,8 +25,11 @@ repetition) and **Gyroid caves** (an implicit surface, lit by your own lamp).
 
 - `storage`: your worlds (up to 60) and which one is showing.
 - `overlay`: Full window, to fly over the whole workshop window.
-- `door` (`load`, `get`, `list`, `show`, `snap`, `status`): Claude sessions make, read and switch
-  worlds, and `snap` hands back a picture so a session can see what it made.
+- `sessions: "write"`: the prompt box types your request into the session you pick, as one
+  `[Demoscene] …` line. Only when you press Make, never otherwise.
+- `door` (`get`, `guide`, `list`, `load`, `show`, `snap`, `status`): Claude sessions read the
+  guide, make, read and switch worlds, and `snap` hands back a picture so a session can see what
+  it made.
 
 No network: nothing is fetched and nothing leaves your Mac.
 
