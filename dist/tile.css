@@ -1,0 +1,116 @@
+/* The world is the tile's own art; everything drawn over it (the HUD) follows the theme. */
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  color: var(--ws-ink);
+  font: 12px/1.4 var(--ws-font, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif);
+}
+#screen {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  image-rendering: pixelated;
+  outline: none;
+  cursor: pointer;
+}
+body:not([data-view='tile']) #screen {
+  cursor: grab;
+}
+body:not([data-view='tile']) #screen:active {
+  cursor: grabbing;
+}
+#hud {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  pointer-events: none;
+}
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ws-panel) 82%, transparent);
+  border: 1px solid var(--ws-line);
+  pointer-events: auto;
+  transition: opacity 0.6s;
+}
+.title {
+  font-weight: 700;
+  padding: 0 2px;
+}
+.chip {
+  font-family: var(--ws-font-mono, monospace);
+  font-size: 11px;
+  color: var(--ws-accent-ink, var(--ws-accent));
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--ws-accent) 16%, var(--ws-panel));
+}
+.chip.over {
+  color: var(--ws-red);
+  background: color-mix(in srgb, var(--ws-red) 16%, var(--ws-panel));
+}
+button {
+  font: inherit;
+  color: var(--ws-ink);
+  background: transparent;
+  border: 1px solid var(--ws-line);
+  border-radius: 6px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+button:hover {
+  border-color: var(--ws-accent);
+}
+button.on {
+  border-color: var(--ws-accent);
+  color: var(--ws-accent-ink, var(--ws-accent));
+}
+button.danger {
+  border-color: var(--ws-red);
+  color: var(--ws-red);
+}
+.error {
+  max-width: 420px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: var(--ws-red);
+  background: color-mix(in srgb, var(--ws-red) 16%, var(--ws-panel));
+  pointer-events: auto;
+}
+#help {
+  position: fixed;
+  left: 10px;
+  bottom: 10px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--ws-muted);
+  background: color-mix(in srgb, var(--ws-panel) 82%, transparent);
+  pointer-events: none;
+  transition: opacity 0.6s;
+}
+body[data-view='tile'] #help,
+body[data-view='float'] #help,
+body.quiet #help,
+body.quiet .bar {
+  opacity: 0;
+}
+body.quiet .bar:hover {
+  opacity: 1;
+}

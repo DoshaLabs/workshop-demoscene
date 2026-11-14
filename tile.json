@@ -1,0 +1,18 @@
+{
+  "id": "demoscene",
+  "name": "Demoscene",
+  "version": "0.1.0",
+  "workshop": "^1.1",
+  "author": "DoshaLabs",
+  "repo": "https://github.com/DoshaLabs/workshop-demoscene",
+  "hint": "Tiny ray-marched worlds a Claude session writes for you, to fly around",
+  "icon": "icon.svg",
+  "entry": "dist/index.html",
+  "pane": true,
+  "span": 1,
+  "permissions": {
+    "storage": true,
+    "overlay": true,
+    "door": { "ops": ["get", "list", "load", "show", "snap", "status"], "timeoutMs": 15000 }
+  }
+}

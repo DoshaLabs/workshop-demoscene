@@ -1,0 +1,526 @@
+import { Renderer } from './renderer.js'
+import { meta, size, formatSize, BUDGET, MAX_SOURCE } from './scene.js'
+import { SEEDS } from './scenes.js'
+
+const W = window.workshop
+const canvas = document.getElementById('screen')
+const hud = document.getElementById('hud')
+const help = document.getElementById('help')
+
+const MAX_SCENES = 60
+const STEPS = { tile: 90, float: 90, pane: 150, overlay: 200 }
+const MAX_SCALE = { tile: 0.5, float: 0.5, pane: 0.75, overlay: 1 }
+const FPS_CAP = { tile: 30, float: 30, pane: 60, overlay: 60 }
+
+let view = W.view
+let saved = [] // the user's own scenes: { id, src, at }
+let scene = null // the one running: an entry plus { meta, bytes }
+let previous = null // the id to fall back to if the GPU drops this one
+let loadedAt = performance.now()
+let error = ''
+const cam = { x: 0, y: 2, z: 0, yaw: 0, pitch: 0, yawVel: 0, pitchVel: 0 }
+let autopilot = true
+let speedMul = 1
+const keys = new Set()
+let reading = null // what the last probe said about the space around the camera
+let unstick = 0 // probes left to climb out of rock after a respawn
+let scale = (MAX_SCALE[view] ?? 0.5) * 0.8
+let fps = 0
+
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x))
+const add = (a, b, k = 1) => [a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k]
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+const norm = (v) => {
+  const l = Math.hypot(...v)
+  return l > 1e-6 ? v.map((c) => c / l) : [0, 1, 0]
+}
+
+const all = () => [...SEEDS.map((s) => ({ ...s, builtIn: true })), ...saved]
+const titleOf = (entry) => meta(entry.src).title
+
+// ---- the camera --------------------------------------------------------------------------------
+
+function basis(c = cam) {
+  const cp = Math.cos(c.pitch)
+  const f = [Math.sin(c.yaw) * cp, Math.sin(c.pitch), Math.cos(c.yaw) * cp]
+  const r = norm(cross([0, 1, 0], f))
+  return { f, r, u: cross(f, r) }
+}
+
+function camUniform(c = cam) {
+  const { f, r, u } = basis(c)
+  return { pos: [c.x, c.y, c.z], basis: [...r, ...u, ...f] }
+}
+
+const speed = () => (scene?.meta.speed ?? 3) * speedMul
+const lookahead = () => clamp(speed() * 1.2, 1.5, 10)
+
+function respawn() {
+  const s = scene.meta.spawn
+  Object.assign(cam, { x: s.x, y: s.y, z: s.z, yaw: s.yaw, pitch: 0, yawVel: 0, pitchVel: 0 })
+  reading = null
+  unstick = 60
+}
+
+/** Where map() is read each frame: the camera and six points around it (the gradient), then five
+ * points a look-ahead away (straight on, right, left, up, down), then one nearer straight on. */
+function probePoints() {
+  const { f, r } = basis()
+  const p = [cam.x, cam.y, cam.z]
+  const L = lookahead()
+  const e = 0.15
+  const dir = (a, b, wb) => norm(add(a, b, wb))
+  return [
+    p,
+    add(p, [e, 0, 0]), add(p, [-e, 0, 0]), add(p, [0, e, 0]), add(p, [0, -e, 0]), add(p, [0, 0, e]), add(p, [0, 0, -e]),
+    add(p, f, L),
+    add(p, dir(f, r, 1), L), add(p, dir(f, r, -1), L),
+    add(p, dir(f, [0, 1, 0], 1), L), add(p, dir(f, [0, 1, 0], -1), L),
+    add(p, f, L * 0.4)
+  ]
+}
+
+function applyReading({ d }) {
+  const grad = norm([d[1] - d[2], d[3] - d[4], d[5] - d[6]])
+  const now = { d0: d[0], grad, ahead: d[7], right: d[8], left: d[9], up: d[10], down: d[11], near: d[12] }
+  // Steering reads a smoothed copy: raw readings jitter frame to frame, and steering on jitter
+  // shakes the camera. Collision (d0, grad) stays raw, so it is never late.
+  if (!reading) reading = now
+  else for (const k of ['ahead', 'right', 'left', 'up', 'down', 'near']) reading[k] += (now[k] - reading[k]) * 0.3
+  reading.d0 = now.d0
+  reading.grad = grad
+  if (unstick > 0) {
+    // A spawn (or a respawn) inside rock climbs until it is in the open.
+    if (d[0] < 0.4) {
+      cam.y += Math.max(0.5, 0.4 - d[0])
+      unstick--
+      return
+    }
+    unstick = 0
+  }
+  if (d[0] <= -0.95) return void (unstick = 60) // deep inside something: climb out
+  const R = 0.25
+  if (d[0] < R) {
+    const k = R - d[0]
+    cam.x += grad[0] * k
+    cam.y += grad[1] * k
+    cam.z += grad[2] * k
+  }
+}
+
+/** The autopilot: wander, turn toward the more open side when something is ahead, keep off floors. */
+function steer(dt, t) {
+  let yawT = 0.22 * Math.sin(t * 0.13) + 0.12 * Math.sin(t * 0.37 + 1)
+  let pitchT = -cam.pitch * 0.8
+  if (reading) {
+    const L = lookahead()
+    const danger = clamp(1 - reading.ahead / (L * 0.7), 0, 1)
+    if (danger > 0) {
+      // In proportion to how much more open one side is: equal sides mean no turn, not a coin flip.
+      const side = (reading.right - reading.left) / (Math.abs(reading.right) + Math.abs(reading.left) + 0.5)
+      yawT = side * 2.5 * danger + yawT * (1 - danger)
+      // Turn first; climb or dive only when both sides are shut, so it stays down in a canyon.
+      const boxedIn = Math.max(reading.left, reading.right) < L * 0.5
+      if (boxedIn) pitchT += ((reading.up - reading.down) / (Math.abs(reading.up) + Math.abs(reading.down) + 0.5)) * 1.5 * danger
+    }
+    // Hover in a band over the ground: sink above it, lift below it. (A scene may scale map() down,
+    // so these are small numbers in map()'s own units, not true distances.)
+    if (reading.down > 2) pitchT -= Math.min(0.3, (reading.down - 2) * 0.1)
+    if (reading.down < 1.2) pitchT += (1.2 - reading.down) * 0.8
+    if (reading.up < 1.2) pitchT -= (1.2 - reading.up) * 0.8
+  }
+  cam.yawVel += (yawT - cam.yawVel) * Math.min(1, dt * 2)
+  cam.pitchVel += (pitchT - cam.pitchVel) * Math.min(1, dt * 2)
+  cam.yaw += cam.yawVel * dt
+  cam.pitch = clamp(cam.pitch + cam.pitchVel * dt, -0.9, 0.9)
+}
+
+function update(dt, t) {
+  const { f, r } = basis()
+  let v = [0, 0, 0]
+  if (autopilot) {
+    steer(dt, t)
+    const room = reading ? clamp(Math.min(reading.ahead, reading.near * 2.5) / lookahead(), 0.25, 1) : 0.5
+    v = basis().f.map((c) => c * speed() * room)
+  } else {
+    const on = (...codes) => codes.some((c) => keys.has(c))
+    if (on('ArrowLeft')) cam.yaw -= 1.6 * dt
+    if (on('ArrowRight')) cam.yaw += 1.6 * dt
+    if (on('ArrowUp')) cam.pitch = clamp(cam.pitch + 1.2 * dt, -1.5, 1.5)
+    if (on('ArrowDown')) cam.pitch = clamp(cam.pitch - 1.2 * dt, -1.5, 1.5)
+    let m = [0, 0, 0]
+    if (on('KeyW')) m = add(m, f)
+    if (on('KeyS')) m = add(m, f, -1)
+    if (on('KeyD')) m = add(m, r)
+    if (on('KeyA')) m = add(m, r, -1)
+    if (on('Space', 'KeyE')) m = add(m, [0, 1, 0])
+    if (on('ShiftLeft', 'ShiftRight', 'KeyQ')) m = add(m, [0, -1, 0])
+    if (Math.hypot(...m) > 0) v = norm(m).map((c) => c * speed() * 2)
+  }
+  let step = dt
+  const move = Math.hypot(...v) * dt
+  if (reading && move > 0) {
+    // Never step further than the nearest surface: a ray march, one step a frame.
+    const most = Math.max(reading.d0 * 0.8, 0.02)
+    if (move > most) step = (dt * most) / move
+  }
+  cam.x += v[0] * step
+  cam.y += v[1] * step
+  cam.z += v[2] * step
+}
+
+// ---- scenes ------------------------------------------------------------------------------------
+
+function activate(entry, compiled) {
+  const r = compiled ?? renderer.compile(entry.src)
+  if (!r.ok) return r
+  renderer.use(r.program)
+  if (scene && scene.id !== entry.id) previous = scene.id
+  scene = { ...entry, meta: meta(entry.src), bytes: size(entry.src) }
+  respawn()
+  loadedAt = performance.now()
+  error = ''
+  W.head.set({ title: scene.meta.title, badge: formatSize(scene.bytes) }).catch(() => {})
+  W.storage.set('current', entry.id).catch(() => {})
+  drawHud()
+  return r
+}
+
+function step(k) {
+  const list = all()
+  const i = list.findIndex((s) => s.id === scene?.id)
+  const next = list[(i + k + list.length) % list.length]
+  const r = activate(next)
+  if (!r.ok) {
+    error = `${titleOf(next)} did not compile`
+    drawHud()
+  }
+}
+
+function find(arg) {
+  const list = all()
+  const n = Number(arg)
+  if (Number.isInteger(n) && n >= 1 && n <= list.length) return list[n - 1]
+  const q = String(arg ?? '').trim().toLowerCase()
+  return list.find((s) => titleOf(s).toLowerCase() === q) ?? list.find((s) => titleOf(s).toLowerCase().startsWith(q))
+}
+
+async function remove(id) {
+  saved = saved.filter((s) => s.id !== id)
+  await W.storage.set('scenes', saved)
+  if (scene?.id === id) activate(all().find((s) => s.id === previous) ?? all()[0])
+}
+
+// ---- the frame loop ----------------------------------------------------------------------------
+
+let last = performance.now()
+let lastDraw = 0
+let slow = 0
+let quick = 0
+
+function adapt(dt) {
+  const target = 1 / (FPS_CAP[view] ?? 60)
+  fps = fps ? fps * 0.95 + (1 / dt) * 0.05 : 1 / dt
+  if (dt > target * 1.35) {
+    quick = 0
+    if (++slow > 5) {
+      scale = Math.max(0.15, scale * 0.85)
+      slow = 0
+    }
+  } else if (dt < target * 1.12) {
+    slow = 0
+    if (++quick > 60) {
+      scale = Math.min(MAX_SCALE[view] ?? 0.5, scale * 1.08)
+      quick = 0
+    }
+  }
+}
+
+function resize() {
+  const w = Math.max(32, Math.round(canvas.clientWidth * scale))
+  const h = Math.max(18, Math.round(canvas.clientHeight * scale))
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w
+    canvas.height = h
+  }
+}
+
+function tick(now) {
+  requestAnimationFrame(tick)
+  if (document.hidden || !scene || renderer.lost) {
+    last = now
+    return
+  }
+  if (now - lastDraw < 1000 / (FPS_CAP[view] ?? 60) - 2) return
+  const dt = Math.min(0.1, (now - last) / 1000)
+  last = now
+  lastDraw = now
+  const res = renderer.poll()
+  if (res) applyReading(res)
+  const t = (now - loadedAt) / 1000
+  update(dt, t)
+  renderer.probe(probePoints(), camUniform(), t)
+  resize()
+  renderer.draw(canvas.width, canvas.height, camUniform(), t, STEPS[view] ?? 120)
+  adapt(dt)
+}
+
+// ---- the HUD -----------------------------------------------------------------------------------
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag)
+  if (cls) n.className = cls
+  if (text != null) n.textContent = text
+  return n
+}
+
+function button(text, title, onClick, cls = '') {
+  const b = el('button', cls, text)
+  b.title = title
+  b.addEventListener('click', (e) => {
+    e.stopPropagation()
+    onClick(b)
+  })
+  b.addEventListener('pointerdown', (e) => e.stopPropagation())
+  return b
+}
+
+let armed = null
+
+function drawHud() {
+  hud.replaceChildren()
+  document.body.dataset.view = view
+  if (!scene) return
+  if (view === 'tile' || view === 'float') {
+    if (error) hud.append(el('div', 'error', error))
+    return
+  }
+  const bar = el('div', 'bar')
+  bar.append(button('‹', 'Previous world (,)', () => step(-1)), el('span', 'title', scene.meta.title), button('›', 'Next world (.)', () => step(1)))
+  const chip = el('span', `chip${scene.bytes > BUDGET ? ' over' : ''}`, `${formatSize(scene.bytes)} / 4 KB`)
+  chip.title = 'The scene minified, as a 4K intro counts it'
+  bar.append(chip)
+  bar.append(
+    button(autopilot ? 'Autopilot on' : 'Autopilot off', 'Fly by itself (P)', () => {
+      autopilot = !autopilot
+      drawHud()
+    }, autopilot ? 'on' : '')
+  )
+  if (view === 'pane') bar.append(button('Full window', 'Fly over the whole window (F)', () => W.openOverlay().catch((e) => flash(e.message))))
+  if (!scene.builtIn) {
+    bar.append(
+      button(armed === scene.id ? 'Delete?' : '×', 'Delete this world', (b) => {
+        if (armed === scene.id) {
+          armed = null
+          remove(scene.id)
+          return
+        }
+        armed = scene.id
+        drawHud()
+        setTimeout(() => {
+          if (armed) {
+            armed = null
+            drawHud()
+          }
+        }, 3000)
+      }, armed === scene.id ? 'danger' : '')
+    )
+  }
+  hud.append(bar)
+  if (error) hud.append(el('div', 'error', error))
+  help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · R respawn · , . worlds'
+  wake()
+}
+
+function flash(text) {
+  error = text
+  drawHud()
+}
+
+let idle
+function wake() {
+  document.body.classList.remove('quiet')
+  clearTimeout(idle)
+  idle = setTimeout(() => document.body.classList.add('quiet'), 5000)
+}
+
+// ---- input -------------------------------------------------------------------------------------
+
+let drag = null
+canvas.addEventListener('pointerdown', (e) => {
+  if (view === 'tile') return void W.openPane().catch(() => {})
+  if (view === 'float') return
+  canvas.focus()
+  drag = { x: e.clientX, y: e.clientY, moved: false }
+  canvas.setPointerCapture(e.pointerId)
+})
+canvas.addEventListener('pointermove', (e) => {
+  wake()
+  if (!drag) return
+  const dx = e.clientX - drag.x
+  const dy = e.clientY - drag.y
+  if (!drag.moved && Math.hypot(dx, dy) < 3) return
+  if (!drag.moved && autopilot) {
+    autopilot = false
+    drawHud()
+  }
+  drag.moved = true
+  cam.yaw += dx * 0.004
+  cam.pitch = clamp(cam.pitch - dy * 0.004, -1.5, 1.5)
+  cam.yawVel = cam.pitchVel = 0
+  drag.x = e.clientX
+  drag.y = e.clientY
+})
+const endDrag = () => (drag = null)
+canvas.addEventListener('pointerup', endDrag)
+canvas.addEventListener('pointercancel', endDrag)
+
+const MOVE = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE', 'KeyQ', 'ShiftLeft', 'ShiftRight', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'])
+addEventListener('keydown', (e) => {
+  if (view === 'tile' || view === 'float' || e.metaKey || e.ctrlKey || e.altKey) return
+  wake()
+  if (MOVE.has(e.code)) {
+    keys.add(e.code)
+    if (autopilot) {
+      autopilot = false
+      drawHud()
+    }
+  } else if (e.code === 'KeyP') {
+    autopilot = !autopilot
+    drawHud()
+  } else if (e.code === 'KeyR') respawn()
+  else if (e.code === 'KeyF' && view === 'pane') W.openOverlay().catch((err) => flash(err.message))
+  else if (e.code === 'Comma') step(-1)
+  else if (e.code === 'Period') step(1)
+  else return
+  e.preventDefault()
+})
+addEventListener('keyup', (e) => keys.delete(e.code))
+addEventListener('blur', () => keys.clear())
+addEventListener(
+  'wheel',
+  (e) => {
+    if (view === 'tile' || view === 'float') return // the column's
+    e.preventDefault()
+    speedMul = clamp(speedMul * Math.exp(-e.deltaY * 0.002), 0.2, 8)
+  },
+  { passive: false }
+)
+
+W.onViewChange((v) => {
+  view = v
+  scale = Math.min(scale, MAX_SCALE[v] ?? 0.5)
+  if (v === 'tile') {
+    autopilot = true
+    keys.clear()
+  }
+  drawHud()
+})
+
+// ---- the door: how a Claude session makes and shows worlds -------------------------------------
+
+W.door.handle('load', async (args) => {
+  const src = (args.length === 1 ? args[0] : args.join(' ')).trim()
+  if (!src) throw new Error('usage: load "$(cat scene.glsl)", the whole scene as one argument')
+  if (src.length > MAX_SOURCE) throw new Error(`the scene is ${src.length} characters; the most is ${MAX_SOURCE}`)
+  if (!/\bfloat\s+map\s*\(\s*vec3\b/.test(src)) throw new Error('a scene must define float map(vec3 p): the distance from p to the nearest surface')
+  const r = renderer.compile(src)
+  if (!r.ok) throw new Error(`it did not compile:\n${r.log}`)
+  const title = meta(src).title
+  const same = scene && !scene.builtIn && titleOf(scene) === title ? saved.find((s) => s.id === scene.id) : null
+  let entry
+  if (same) {
+    same.src = src
+    same.at = Date.now()
+    entry = same
+  } else {
+    entry = { id: `s${Date.now().toString(36)}`, src, at: Date.now() }
+    saved.push(entry)
+    while (saved.length > MAX_SCENES) saved.shift()
+  }
+  await W.storage.set('scenes', saved)
+  activate(entry, r)
+  const bytes = size(src)
+  return {
+    title,
+    bytes,
+    budget: BUDGET,
+    ...(bytes > BUDGET ? { note: `over the ${BUDGET}-byte budget` } : {}),
+    replaced: Boolean(same),
+    world: all().findIndex((s) => s.id === entry.id) + 1
+  }
+})
+
+W.door.handle('get', async (args) => {
+  const entry = args[0] ? find(args[0]) : scene
+  if (!entry) throw new Error(`no world called "${args[0]}"; see list`)
+  return entry.src
+})
+
+W.door.handle('list', async () =>
+  all().map((s, i) => ({ n: i + 1, title: titleOf(s), bytes: size(s.src), builtIn: Boolean(s.builtIn), current: s.id === scene?.id }))
+)
+
+W.door.handle('show', async (args) => {
+  const entry = find(args.join(' '))
+  if (!entry) throw new Error(`no world "${args.join(' ')}"; see list`)
+  const r = activate(entry)
+  if (!r.ok) throw new Error(`it did not compile:\n${r.log}`)
+  return { title: titleOf(entry) }
+})
+
+W.door.handle('status', async () => ({
+  title: scene?.meta.title ?? null,
+  bytes: scene?.bytes ?? 0,
+  budget: BUDGET,
+  view,
+  autopilot,
+  fps: Math.round(fps),
+  resolution: [canvas.width, canvas.height],
+  camera: { x: +cam.x.toFixed(2), y: +cam.y.toFixed(2), z: +cam.z.toFixed(2), yaw: Math.round((cam.yaw * 180) / Math.PI), pitch: Math.round((cam.pitch * 180) / Math.PI) },
+  clearance: reading ? +reading.d0.toFixed(2) : null,
+  error: error || null
+}))
+
+W.door.handle('snap', async (args) => {
+  if (!scene) throw new Error('nothing is running')
+  let c = cam
+  if (args[0] === 'spawn') {
+    const s = scene.meta.spawn
+    c = { x: s.x, y: s.y, z: s.z, yaw: s.yaw, pitch: 0 }
+  } else if (args.length >= 3) {
+    const [x, y, z, yaw = 0, pitch = 0] = args.map(Number)
+    if (![x, y, z, yaw, pitch].every(Number.isFinite)) throw new Error('usage: snap [spawn | x y z [yaw pitch]] (degrees)')
+    c = { x, y, z, yaw: (yaw * Math.PI) / 180, pitch: (pitch * Math.PI) / 180 }
+  }
+  return renderer.snap(640, 360, camUniform(c), (performance.now() - loadedAt) / 1000, 220)
+})
+
+// ---- start -------------------------------------------------------------------------------------
+
+let renderer
+try {
+  renderer = new Renderer(canvas, {
+    onLost: () => {
+      error = 'The GPU dropped this world: a frame took too long to draw. Going back to the one before.'
+      drawHud()
+    },
+    onRestored: () => {
+      const msg = error
+      const back = all().find((s) => s.id === previous) ?? all()[0]
+      scene = null
+      activate(back)
+      error = msg
+      drawHud()
+    }
+  })
+} catch (e) {
+  hud.append(el('div', 'error', e.message))
+  throw e
+}
+
+const [stored, current] = await Promise.all([W.storage.get('scenes').catch(() => null), W.storage.get('current').catch(() => null)])
+saved = Array.isArray(stored) ? stored.filter((s) => s && typeof s.id === 'string' && typeof s.src === 'string') : []
+const first = all().find((s) => s.id === current) ?? all()[0]
+if (!activate(first).ok) activate(all()[0])
+requestAnimationFrame(tick)
