@@ -12,6 +12,21 @@ const STEPS = { tile: 90, float: 90, pane: 150, overlay: 200 }
 const MAX_SCALE = { tile: 0.5, float: 0.5, pane: 0.75, overlay: 1 }
 const FPS_CAP = { tile: 30, float: 30, pane: 60, overlay: 60 }
 
+// Sharp: pixels before frames. In the pane and full window it renders up to the screen's own
+// pixels (2x on a Retina display) and settles for 30 frames a second to afford them.
+let sharp = false
+try { sharp = localStorage.getItem('sharp') === '1' } catch {}
+const big = () => view === 'pane' || view === 'overlay'
+const maxScale = () => (sharp && big() ? Math.min(window.devicePixelRatio || 1, 2) : MAX_SCALE[view] ?? 0.5)
+const fpsCap = () => (sharp && big() ? 30 : FPS_CAP[view] ?? 60)
+function setSharp(on) {
+  sharp = on
+  try { localStorage.setItem('sharp', on ? '1' : '0') } catch {}
+  scale = sharp && big() ? maxScale() * 0.75 : Math.min(scale, maxScale())
+  flash(sharp ? 'Sharp: full resolution, 30 fps' : 'Smooth: 60 fps, lower resolution')
+  drawHud()
+}
+
 let view = W.view
 let saved = [] // the user's own scenes: { id, src, at }
 let scene = null // the one running: an entry plus { meta, bytes }
@@ -24,7 +39,7 @@ let speedMul = 1
 const keys = new Set()
 let reading = null // what the last probe said about the space around the camera
 let unstick = 0 // probes left to climb out of rock after a respawn
-let scale = (MAX_SCALE[view] ?? 0.5) * 0.8
+let scale = Math.min(maxScale(), 1) * 0.8
 let fps = 0
 
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x))
@@ -238,7 +253,7 @@ let slow = 0
 let quick = 0
 
 function adapt(dt) {
-  const target = 1 / (FPS_CAP[view] ?? 60)
+  const target = 1 / fpsCap()
   fps = fps ? fps * 0.95 + (1 / dt) * 0.05 : 1 / dt
   if (dt > target * 1.35) {
     quick = 0
@@ -249,7 +264,7 @@ function adapt(dt) {
   } else if (dt < target * 1.12) {
     slow = 0
     if (++quick > 60) {
-      scale = Math.min(MAX_SCALE[view] ?? 0.5, scale * 1.08)
+      scale = Math.min(maxScale(), scale * 1.08)
       quick = 0
     }
   }
@@ -270,7 +285,7 @@ function tick(now) {
     last = now
     return
   }
-  if (now - lastDraw < 1000 / (FPS_CAP[view] ?? 60) - 2) return
+  if (now - lastDraw < 1000 / fpsCap() - 2) return
   const dt = Math.min(0.1, (now - last) / 1000)
   last = now
   lastDraw = now
@@ -322,6 +337,7 @@ function readPad(dt) {
     drawHud()
   }
   if (pressed(0)) respawn()
+  if (pressed(8) || pressed(9)) setSharp(!sharp)
   if (pressed(14)) step(-1)
   if (pressed(15)) step(1)
   if (active) wake()
@@ -372,6 +388,7 @@ function drawHud() {
       drawHud()
     }, autopilot ? 'on' : '')
   )
+  bar.append(button('Sharp', 'Full resolution at 30 fps, or lower resolution at 60 (H)', () => setSharp(!sharp), sharp ? 'on' : ''))
   if (view === 'pane') bar.append(button('Full window', 'Fly over the whole window (F)', () => W.openOverlay().catch((e) => flash(e.message))))
   if (!scene.builtIn) {
     bar.append(
@@ -395,7 +412,7 @@ function drawHud() {
   hud.append(bar)
   if (error) hud.append(el('div', 'error', error))
   if (asked) hud.append(asked)
-  help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · R respawn · , . worlds · controller: sticks fly and look, triggers up and down, bumpers speed, Y autopilot'
+  help.textContent = 'drag to look · WASD fly · Space / Q up and down · arrows turn · wheel speed · P autopilot · H sharp · R respawn · , . worlds · controller: sticks fly and look, triggers up and down, bumpers speed, Y autopilot'
   wake()
 }
 
@@ -457,6 +474,7 @@ addEventListener('keydown', (e) => {
     autopilot = !autopilot
     drawHud()
   } else if (e.code === 'KeyR') respawn()
+  else if (e.code === 'KeyH') setSharp(!sharp)
   else if (e.code === 'KeyF' && view === 'pane') W.openOverlay().catch((err) => flash(err.message))
   else if (e.code === 'Comma') step(-1)
   else if (e.code === 'Period') step(1)
@@ -477,7 +495,7 @@ addEventListener(
 
 W.onViewChange((v) => {
   view = v
-  scale = Math.min(scale, MAX_SCALE[v] ?? 0.5)
+  scale = Math.min(scale, maxScale())
   if (v === 'tile') {
     autopilot = true
     keys.clear()
@@ -617,6 +635,8 @@ W.door.handle('status', async () => ({
   autopilot,
   fps: Math.round(fps),
   resolution: [canvas.width, canvas.height],
+  sharp,
+  scale: +scale.toFixed(2),
   camera: { x: +cam.x.toFixed(2), y: +cam.y.toFixed(2), z: +cam.z.toFixed(2), yaw: Math.round((cam.yaw * 180) / Math.PI), pitch: Math.round((cam.pitch * 180) / Math.PI) },
   clearance: reading ? +reading.d0.toFixed(2) : null,
   gamepad: pad.name,
